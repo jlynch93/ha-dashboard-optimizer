@@ -1,81 +1,86 @@
 import { NextRequest, NextResponse } from "next/server";
+import type { OllamaInstance } from "@/lib/types";
 
-interface OllamaInstance {
+export const dynamic = "force-dynamic";
+
+interface Candidate {
   url: string;
-  models: string[];
   label: string;
 }
 
-async function probeOllama(
-  url: string,
-  label: string,
-  timeoutMs = 3000
+interface RequestBody {
+  /** Additional URLs the user wants to probe. */
+  additionalUrls?: string[];
+  /** If true, also scan the common LAN IPs. Default false. */
+  scanLan?: boolean;
+}
+
+const LOCAL_CANDIDATES: Candidate[] = [
+  { url: "http://localhost:11434", label: "Localhost" },
+  { url: "http://127.0.0.1:11434", label: "Loopback" },
+  { url: "http://host.docker.internal:11434", label: "Docker Host" },
+];
+
+const LAN_PREFIXES = ["192.168.1", "192.168.0", "10.0.0", "10.0.1"];
+const LAN_HOSTS = [1, 2, 5, 10, 50, 100, 200, 254];
+
+function buildLanCandidates(): Candidate[] {
+  const out: Candidate[] = [];
+  for (const prefix of LAN_PREFIXES) {
+    for (const host of LAN_HOSTS) {
+      out.push({ url: `http://${prefix}.${host}:11434`, label: `LAN (${prefix}.${host})` });
+    }
+  }
+  return out;
+}
+
+async function probe(
+  candidate: Candidate,
+  timeoutMs: number,
 ): Promise<OllamaInstance | null> {
   try {
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), timeoutMs);
-
-    const response = await fetch(`${url}/api/tags`, {
-      signal: controller.signal,
+    const response = await fetch(`${candidate.url}/api/tags`, {
+      signal: AbortSignal.timeout(timeoutMs),
     });
-    clearTimeout(timeout);
-
-    if (response.ok) {
-      const data = await response.json();
-      const models = (data.models || []).map(
-        (m: { name: string }) => m.name
-      );
-      return { url, models, label };
-    }
+    if (!response.ok) return null;
+    const data = (await response.json()) as { models?: Array<{ name: string }> };
+    const models = (data.models ?? []).map((m) => m.name);
+    return { url: candidate.url, models, label: candidate.label };
   } catch {
-    // Connection failed - not available at this address
+    // Unreachable — not an Ollama here.
+    return null;
   }
-  return null;
 }
 
 export async function POST(request: NextRequest) {
+  let body: RequestBody = {};
   try {
-    const { additionalUrls } = await request.json().catch(() => ({}));
-
-    // Common places Ollama might be running
-    const candidates: { url: string; label: string }[] = [
-      { url: "http://localhost:11434", label: "Localhost" },
-      { url: "http://127.0.0.1:11434", label: "Loopback" },
-      { url: "http://host.docker.internal:11434", label: "Docker Host" },
-    ];
-
-    // Add common LAN patterns
-    const lanPrefixes = ["192.168.1", "192.168.0", "10.0.0", "10.0.1"];
-    for (const prefix of lanPrefixes) {
-      // Try common server IPs on each subnet
-      for (const host of [1, 2, 5, 10, 50, 100, 200, 254]) {
-        candidates.push({
-          url: `http://${prefix}.${host}:11434`,
-          label: `LAN (${prefix}.${host})`,
-        });
-      }
-    }
-
-    // Add user-provided URLs
-    if (additionalUrls && Array.isArray(additionalUrls)) {
-      for (const url of additionalUrls) {
-        if (url && typeof url === "string") {
-          candidates.push({ url: url.replace(/\/$/, ""), label: "Custom" });
-        }
-      }
-    }
-
-    // Probe all candidates in parallel with timeout
-    const results = await Promise.all(
-      candidates.map((c) => probeOllama(c.url, c.label, 2000))
-    );
-
-    const discovered = results.filter(Boolean) as OllamaInstance[];
-
-    return NextResponse.json({ instances: discovered });
-  } catch (error: unknown) {
-    const message =
-      error instanceof Error ? error.message : "Discovery failed";
-    return NextResponse.json({ error: message, instances: [] }, { status: 500 });
+    body = (await request.json()) as RequestBody;
+  } catch {
+    // Empty body is allowed.
   }
+
+  const candidates: Candidate[] = [...LOCAL_CANDIDATES];
+  if (body.scanLan) candidates.push(...buildLanCandidates());
+  if (Array.isArray(body.additionalUrls)) {
+    for (const url of body.additionalUrls) {
+      if (typeof url === "string" && url.trim()) {
+        candidates.push({ url: url.replace(/\/$/, ""), label: "Custom" });
+      }
+    }
+  }
+
+  // De-duplicate by URL so user-supplied entries don't double-probe the defaults.
+  const seen = new Set<string>();
+  const uniq = candidates.filter((c) => {
+    if (seen.has(c.url)) return false;
+    seen.add(c.url);
+    return true;
+  });
+
+  // Shorter timeout for the wide LAN sweep, longer for targeted checks.
+  const timeout = body.scanLan ? 1500 : 2500;
+  const results = await Promise.all(uniq.map((c) => probe(c, timeout)));
+  const instances = results.filter((r): r is OllamaInstance => r !== null);
+  return NextResponse.json({ instances });
 }
