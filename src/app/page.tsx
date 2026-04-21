@@ -1,18 +1,20 @@
 "use client";
 
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import { ErrorBanner } from "@/components/ErrorBanner";
-import { GenerateInput } from "@/components/GenerateInput";
+import { GenerateInput, type GenerateStrategy } from "@/components/GenerateInput";
 import { Header } from "@/components/Header";
 import { ModeTabs, type Mode } from "@/components/ModeTabs";
 import { OptimizeInput } from "@/components/OptimizeInput";
 import { OutputPanel } from "@/components/OutputPanel";
+import { ParallelProgress } from "@/components/ParallelProgress";
 import { SettingsDrawer } from "@/components/SettingsDrawer";
 import { TipsSection } from "@/components/TipsSection";
 import { useToast } from "@/components/Toaster";
 import { useDashboardJob } from "@/hooks/useDashboardJob";
 import { useHomeAssistant } from "@/hooks/useHomeAssistant";
+import { useLocalStorage } from "@/hooks/useLocalStorage";
 import { useOllama } from "@/hooks/useOllama";
 
 export default function Home() {
@@ -20,11 +22,31 @@ export default function Home() {
   const [showSettings, setShowSettings] = useState(false);
   const [yamlInput, setYamlInput] = useState("");
   const [clientError, setClientError] = useState("");
+  // Persist user's preferred generation strategy across reloads.
+  const [strategy, setStrategyRaw] = useLocalStorage("generateStrategy", "fast");
+  const strategyValue: GenerateStrategy = strategy === "quality" ? "quality" : "fast";
+  const setStrategy = useCallback(
+    (s: GenerateStrategy) => setStrategyRaw(s),
+    [setStrategyRaw],
+  );
 
   const ollama = useOllama();
   const ha = useHomeAssistant();
   const job = useDashboardJob();
   const toast = useToast();
+
+  // All Ollama endpoints we can fan out across in Fast mode.
+  // The currently selected URL always goes first (used for the planner).
+  const endpointPool = useMemo(() => {
+    const urls = [ollama.ollamaUrl, ...ollama.discoveredInstances.map((i) => i.url)];
+    const seen = new Set<string>();
+    return urls.filter((u) => {
+      if (!u || seen.has(u)) return false;
+      seen.add(u);
+      return true;
+    });
+  }, [ollama.ollamaUrl, ollama.discoveredInstances]);
+  const extraEndpoints = endpointPool.slice(1);
 
   // Fire a one-time toast when Ollama discovery finishes and finds something.
   const discoveryNotified = useRef(false);
@@ -62,22 +84,24 @@ export default function Home() {
       return;
     }
     setClientError("");
+    const isFast = strategyValue === "fast";
     const result = await job.start({
-      mode: "generate",
+      mode: isFast ? "generate-fast" : "generate",
       ollamaUrl: ollama.ollamaUrl,
       model: ollama.model,
       summary: ha.summary,
+      extraEndpoints: isFast ? extraEndpoints : undefined,
     });
     if (result.ok) {
       toast.push({
-        title: "Dashboard generated",
+        title: isFast ? "Dashboard generated (Fast)" : "Dashboard generated",
         description: `Finished in ${(job.stats.elapsedMs / 1000).toFixed(1)}s`,
         kind: "success",
       });
     } else if (result.aborted) {
       toast.push({ title: "Generation cancelled", kind: "info", durationMs: 2000 });
     }
-  }, [ha.summary, ollama.ollamaUrl, ollama.model, job, toast]);
+  }, [ha.summary, ollama.ollamaUrl, ollama.model, strategyValue, extraEndpoints, job, toast]);
 
   const handleOptimize = useCallback(async () => {
     if (!yamlInput.trim()) {
@@ -154,6 +178,9 @@ export default function Home() {
                 ollamaConnected={ollama.connected}
                 loading={job.loading}
                 model={ollama.model}
+                strategy={strategyValue}
+                onStrategyChange={setStrategy}
+                hostCount={endpointPool.length}
                 onGenerate={handleGenerate}
                 onCancel={cancelWithToast}
                 onOpenSettings={() => setShowSettings(true)}
@@ -187,14 +214,28 @@ export default function Home() {
             </p>
           </div>
 
-          <OutputPanel
-            mode={mode}
-            output={job.output}
-            explanation={job.explanation}
-            validation={job.validation}
-            loading={job.loading}
-            stats={job.stats}
-          />
+          <div className="space-y-4">
+            {/* Fast mode: show per-view progress grid while the job runs.
+                Once complete, the stitched YAML renders in the regular output
+                pane below, so the user sees both the live plan and the final
+                document. In Quality mode this is a no-op. */}
+            {(job.views.length > 0 || (job.loading && strategyValue === "fast" && mode === "generate")) && (
+              <ParallelProgress
+                views={job.views}
+                plan={job.plan}
+                elapsedMs={job.stats.elapsedMs}
+                loading={job.loading}
+              />
+            )}
+            <OutputPanel
+              mode={mode}
+              output={job.output}
+              explanation={job.explanation}
+              validation={job.validation}
+              loading={job.loading}
+              stats={job.stats}
+            />
+          </div>
         </div>
 
         <TipsSection />

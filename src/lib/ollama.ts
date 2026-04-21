@@ -15,6 +15,8 @@ export interface OllamaChatOptions {
   timeoutMs?: number;
   /** Passed straight through to Ollama's `options` field. */
   options?: Record<string, unknown>;
+  /** Ollama's top-level `format` field. Use "json" to force JSON output. */
+  format?: "json" | string;
 }
 
 export class OllamaError extends Error {
@@ -49,6 +51,7 @@ export async function ollamaChat(opts: OllamaChatOptions): Promise<string> {
     signal,
     timeoutMs = DEFAULT_TIMEOUT_MS,
     options,
+    format,
   } = opts;
 
   const response = await fetchOllama(endpoint, "/api/chat", {
@@ -56,6 +59,7 @@ export async function ollamaChat(opts: OllamaChatOptions): Promise<string> {
     messages,
     stream: false,
     options,
+    ...(format ? { format } : {}),
   }, composeSignal(timeoutMs, signal));
 
   const data = await response.json();
@@ -74,6 +78,7 @@ export async function* ollamaChatStream(opts: OllamaChatOptions): AsyncGenerator
     signal,
     timeoutMs = DEFAULT_TIMEOUT_MS,
     options,
+    format,
   } = opts;
 
   const response = await fetchOllama(endpoint, "/api/chat", {
@@ -81,6 +86,7 @@ export async function* ollamaChatStream(opts: OllamaChatOptions): AsyncGenerator
     messages,
     stream: true,
     options,
+    ...(format ? { format } : {}),
   }, composeSignal(timeoutMs, signal));
 
   if (!response.body) {

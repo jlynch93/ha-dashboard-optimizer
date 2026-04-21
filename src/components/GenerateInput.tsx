@@ -1,8 +1,19 @@
 "use client";
 
 import { useEffect } from "react";
-import { CheckCircle2, Home as HomeIcon, Loader2, Square, Zap } from "lucide-react";
+import {
+  CheckCircle2,
+  Home as HomeIcon,
+  Loader2,
+  Network,
+  Rocket,
+  ShieldCheck,
+  Square,
+  Zap,
+} from "lucide-react";
 import type { HaSummary } from "@/lib/types";
+
+export type GenerateStrategy = "fast" | "quality";
 
 interface GenerateInputProps {
   haConnected: boolean;
@@ -10,6 +21,10 @@ interface GenerateInputProps {
   ollamaConnected: boolean;
   loading: boolean;
   model: string;
+  strategy: GenerateStrategy;
+  onStrategyChange: (strategy: GenerateStrategy) => void;
+  /** How many Ollama hosts the Fast pipeline will fan out across. `1` means no fan-out. */
+  hostCount: number;
   onGenerate: () => void;
   onCancel: () => void;
   onOpenSettings: () => void;
@@ -40,12 +55,17 @@ export function GenerateInput(props: GenerateInputProps) {
     ollamaConnected,
     loading,
     model,
+    strategy,
+    onStrategyChange,
+    hostCount,
     onGenerate,
     onCancel,
     onOpenSettings,
   } = props;
 
   useGenerateShortcut(haConnected && ollamaConnected && !loading, onGenerate);
+
+  const fanningOut = strategy === "fast" && hostCount > 1;
 
   return (
     <>
@@ -103,6 +123,13 @@ export function GenerateInput(props: GenerateInputProps) {
             )}
           </div>
 
+          <StrategyToggle
+            strategy={strategy}
+            onChange={onStrategyChange}
+            disabled={loading}
+            hostCount={hostCount}
+          />
+
           {loading ? (
             <button
               onClick={onCancel}
@@ -117,14 +144,18 @@ export function GenerateInput(props: GenerateInputProps) {
               disabled={!ollamaConnected}
               className="w-full py-3 px-6 bg-gradient-to-r from-cyan-500 to-blue-600 hover:from-cyan-400 hover:to-blue-500 disabled:from-slate-600 disabled:to-slate-700 disabled:cursor-not-allowed text-white font-semibold rounded-xl transition-all flex items-center justify-center gap-2 shadow-lg shadow-cyan-500/20"
             >
-              <Zap className="w-5 h-5" />
-              Generate Recommended Dashboard
+              {strategy === "fast" ? <Rocket className="w-5 h-5" /> : <Zap className="w-5 h-5" />}
+              {strategy === "fast" ? "Generate (Fast)" : "Generate Recommended Dashboard"}
             </button>
           )}
           {loading && (
             <p className="text-xs text-slate-400 text-center flex items-center justify-center gap-2">
               <Loader2 className="w-3 h-3 animate-spin" />
-              Streaming from {model}...
+              {strategy === "fast"
+                ? fanningOut
+                  ? `Planning + fanning out across ${hostCount} hosts (${model})...`
+                  : `Planning + generating views in parallel (${model})...`
+                : `Streaming from ${model}...`}
             </p>
           )}
           {!ollamaConnected && !loading && (
@@ -144,5 +175,82 @@ function Stat({ label, value }: { label: string; value: number }) {
       <p className="text-lg font-bold text-white">{value}</p>
       <p className="text-xs text-slate-400">{label}</p>
     </div>
+  );
+}
+
+function StrategyToggle({
+  strategy,
+  onChange,
+  disabled,
+  hostCount,
+}: {
+  strategy: GenerateStrategy;
+  onChange: (s: GenerateStrategy) => void;
+  disabled: boolean;
+  hostCount: number;
+}) {
+  return (
+    <div className="p-1 bg-slate-900/60 border border-slate-700 rounded-xl space-y-1">
+      <div className="flex items-center gap-1">
+        <StrategyButton
+          active={strategy === "fast"}
+          onClick={() => onChange("fast")}
+          disabled={disabled}
+          icon={<Rocket className="w-4 h-4" />}
+          label="Fast"
+          subtitle="Plan + parallel views"
+        />
+        <StrategyButton
+          active={strategy === "quality"}
+          onClick={() => onChange("quality")}
+          disabled={disabled}
+          icon={<ShieldCheck className="w-4 h-4" />}
+          label="Quality"
+          subtitle="Single-pass, coherent"
+        />
+      </div>
+      {strategy === "fast" && hostCount > 1 && (
+        <p className="flex items-center justify-center gap-1.5 text-[11px] text-cyan-300 px-2 pb-1">
+          <Network className="w-3 h-3" />
+          Fanning out across {hostCount} Ollama hosts
+        </p>
+      )}
+    </div>
+  );
+}
+
+function StrategyButton({
+  active,
+  onClick,
+  disabled,
+  icon,
+  label,
+  subtitle,
+}: {
+  active: boolean;
+  onClick: () => void;
+  disabled: boolean;
+  icon: React.ReactNode;
+  label: string;
+  subtitle: string;
+}) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      disabled={disabled}
+      className={`flex-1 flex items-center gap-2 px-3 py-2 rounded-lg text-sm transition-colors ${
+        active
+          ? "bg-cyan-500/15 text-cyan-100 border border-cyan-500/40"
+          : "text-slate-400 hover:text-slate-200 border border-transparent"
+      } disabled:opacity-60 disabled:cursor-not-allowed`}
+      aria-pressed={active}
+    >
+      <span className={active ? "text-cyan-300" : "text-slate-400"}>{icon}</span>
+      <span className="flex flex-col items-start leading-tight text-left">
+        <span className="font-medium">{label}</span>
+        <span className="text-[11px] text-slate-500">{subtitle}</span>
+      </span>
+    </button>
   );
 }

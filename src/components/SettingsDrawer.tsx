@@ -37,14 +37,23 @@ export function SettingsDrawer(props: SettingsDrawerProps) {
   const panelRef = useRef<HTMLDivElement>(null);
   const firstInputRef = useRef<HTMLInputElement>(null);
 
-  // Esc to close, plus focus first field on open.
+  // Keep a ref to the latest `onClose` so the Esc handler doesn't pin the
+  // effect's identity to it. Otherwise every re-render of the parent (which
+  // happens on every keystroke in any input) would tear down this effect and
+  // re-fire the auto-focus, stealing focus back to the first input.
+  const onCloseRef = useRef(onClose);
+  useEffect(() => {
+    onCloseRef.current = onClose;
+  }, [onClose]);
+
+  // Esc to close, body scroll lock, and focus first field on open. Runs only
+  // when `open` transitions — not on every parent re-render.
   useEffect(() => {
     if (!open) return;
     const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") onClose();
+      if (e.key === "Escape") onCloseRef.current();
     };
     window.addEventListener("keydown", onKey);
-    // Lock body scroll while the drawer is open.
     const previousOverflow = document.body.style.overflow;
     document.body.style.overflow = "hidden";
     // Defer focus to after the open animation starts.
@@ -54,7 +63,7 @@ export function SettingsDrawer(props: SettingsDrawerProps) {
       document.body.style.overflow = previousOverflow;
       window.clearTimeout(focusTimer);
     };
-  }, [open, onClose]);
+  }, [open]);
 
   return (
     <>

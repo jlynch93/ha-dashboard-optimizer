@@ -2,9 +2,14 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import { parseSse } from "@/lib/sse";
+import type {
+  ParallelPlan,
+  ViewProgress,
+  ViewStatus,
+} from "@/lib/parallel-types";
 import type { ExtractedYaml, HaSummary, YamlValidation } from "@/lib/types";
 
-type Mode = "generate" | "optimize";
+type Mode = "generate" | "generate-fast" | "optimize";
 
 interface StartOptions {
   mode: Mode;
@@ -12,6 +17,10 @@ interface StartOptions {
   model: string;
   yaml?: string;
   summary?: HaSummary | null;
+  /** Additional Ollama endpoints to round-robin per-view calls across (Fast mode only). */
+  extraEndpoints?: string[];
+  /** Override planner model; defaults to `model` (Fast mode only). */
+  plannerModel?: string;
 }
 
 export interface JobStats {
@@ -31,6 +40,10 @@ interface UseDashboardJobResult {
   stats: JobStats;
   /** True when the most recent job produced useful output. */
   hasResult: boolean;
+  /** Per-view progress (Fast mode only). Empty for single-pass jobs. */
+  views: ViewProgress[];
+  /** The planner's view assignment (Fast mode only). */
+  plan: ParallelPlan | null;
   start: (options: StartOptions) => Promise<{ ok: boolean; aborted: boolean; error?: string }>;
   cancel: () => void;
   reset: () => void;
@@ -44,6 +57,8 @@ export function useDashboardJob(): UseDashboardJobResult {
   const [validation, setValidation] = useState<YamlValidation | null>(null);
   const [stats, setStats] = useState<JobStats>({ elapsedMs: 0, chars: 0 });
   const [hasResult, setHasResult] = useState(false);
+  const [views, setViews] = useState<ViewProgress[]>([]);
+  const [plan, setPlan] = useState<ParallelPlan | null>(null);
   const abortRef = useRef<AbortController | null>(null);
   const startedAtRef = useRef<number>(0);
 
@@ -63,6 +78,8 @@ export function useDashboardJob(): UseDashboardJobResult {
     setError("");
     setStats({ elapsedMs: 0, chars: 0 });
     setHasResult(false);
+    setViews([]);
+    setPlan(null);
   }, []);
 
   const cancel = useCallback(() => {
@@ -80,12 +97,7 @@ export function useDashboardJob(): UseDashboardJobResult {
       setLoading(true);
       startedAtRef.current = Date.now();
 
-      const endpoint =
-        options.mode === "generate" ? "/api/generate-dashboard" : "/api/optimize";
-      const body =
-        options.mode === "generate"
-          ? { summary: options.summary, ollamaUrl: options.ollamaUrl, model: options.model }
-          : { yaml: options.yaml, ollamaUrl: options.ollamaUrl, model: options.model };
+      const { endpoint, body } = buildRequest(options);
 
       try {
         const res = await fetch(endpoint, {
@@ -101,25 +113,109 @@ export function useDashboardJob(): UseDashboardJobResult {
         if (!res.body) throw new Error("Empty response from server");
 
         let streamed = "";
+        let totalChars = 0;
         for await (const event of parseSse(res.body)) {
-          if (event.event === "chunk") {
-            const { content } = JSON.parse(event.data) as { content: string };
-            streamed += content;
-            setOutput(streamed);
-            setStats((s) => ({ ...s, chars: streamed.length }));
-          } else if (event.event === "done") {
-            const payload = JSON.parse(event.data) as ExtractedYaml;
-            setOutput(payload.optimizedYaml);
-            setExplanation(payload.explanation);
-            setValidation(payload.validation);
-            setHasResult(true);
-            setStats({
-              elapsedMs: Date.now() - startedAtRef.current,
-              chars: payload.optimizedYaml.length,
-            });
-          } else if (event.event === "error") {
-            const payload = JSON.parse(event.data) as { message: string };
-            throw new Error(payload.message);
+          switch (event.event) {
+            case "chunk": {
+              const { content } = JSON.parse(event.data) as { content: string };
+              streamed += content;
+              totalChars += content.length;
+              setOutput(streamed);
+              setStats((s) => ({ ...s, chars: totalChars }));
+              break;
+            }
+            case "planner_start": {
+              // No-op — UI shows the "planning" state via empty views list.
+              break;
+            }
+            case "planner_done": {
+              const payload = JSON.parse(event.data) as { plan: ParallelPlan };
+              setPlan(payload.plan);
+              setViews(
+                payload.plan.views.map((v, i) => ({
+                  index: i,
+                  title: v.title,
+                  icon: v.icon,
+                  status: "pending" as ViewStatus,
+                  chars: 0,
+                })),
+              );
+              break;
+            }
+            case "view_start": {
+              const payload = JSON.parse(event.data) as {
+                index: number;
+                title: string;
+                icon: string;
+                endpoint: string;
+              };
+              setViews((vs) =>
+                vs.map((v) =>
+                  v.index === payload.index
+                    ? { ...v, status: "running", endpoint: payload.endpoint }
+                    : v,
+                ),
+              );
+              break;
+            }
+            case "view_chunk": {
+              const payload = JSON.parse(event.data) as { index: number; content: string };
+              totalChars += payload.content.length;
+              setStats((s) => ({ ...s, chars: totalChars }));
+              setViews((vs) =>
+                vs.map((v) =>
+                  v.index === payload.index
+                    ? { ...v, chars: v.chars + payload.content.length }
+                    : v,
+                ),
+              );
+              break;
+            }
+            case "view_done": {
+              const payload = JSON.parse(event.data) as {
+                index: number;
+                yaml: string;
+                elapsedMs: number;
+              };
+              setViews((vs) =>
+                vs.map((v) =>
+                  v.index === payload.index
+                    ? { ...v, status: "done", yaml: payload.yaml, elapsedMs: payload.elapsedMs }
+                    : v,
+                ),
+              );
+              break;
+            }
+            case "view_error": {
+              const payload = JSON.parse(event.data) as { index: number; message: string };
+              setViews((vs) =>
+                vs.map((v) =>
+                  v.index === payload.index
+                    ? { ...v, status: "error", error: payload.message }
+                    : v,
+                ),
+              );
+              break;
+            }
+            case "done": {
+              const payload = JSON.parse(event.data) as ExtractedYaml;
+              setOutput(payload.optimizedYaml);
+              setExplanation(payload.explanation);
+              setValidation(payload.validation);
+              setHasResult(true);
+              setStats({
+                elapsedMs: Date.now() - startedAtRef.current,
+                chars: payload.optimizedYaml.length,
+              });
+              break;
+            }
+            case "error": {
+              const payload = JSON.parse(event.data) as { message: string };
+              throw new Error(payload.message);
+            }
+            default:
+              // Ignore unknown events so future server-side additions don't crash the client.
+              break;
           }
         }
         return { ok: true, aborted: false };
@@ -146,8 +242,46 @@ export function useDashboardJob(): UseDashboardJobResult {
     validation,
     stats,
     hasResult,
+    views,
+    plan,
     start,
     cancel,
     reset,
   };
+}
+
+function buildRequest(
+  options: StartOptions,
+): { endpoint: string; body: Record<string, unknown> } {
+  switch (options.mode) {
+    case "generate":
+      return {
+        endpoint: "/api/generate-dashboard",
+        body: {
+          summary: options.summary,
+          ollamaUrl: options.ollamaUrl,
+          model: options.model,
+        },
+      };
+    case "generate-fast":
+      return {
+        endpoint: "/api/generate-fast",
+        body: {
+          summary: options.summary,
+          ollamaUrl: options.ollamaUrl,
+          model: options.model,
+          extraEndpoints: options.extraEndpoints,
+          plannerModel: options.plannerModel,
+        },
+      };
+    case "optimize":
+      return {
+        endpoint: "/api/optimize",
+        body: {
+          yaml: options.yaml,
+          ollamaUrl: options.ollamaUrl,
+          model: options.model,
+        },
+      };
+  }
 }
