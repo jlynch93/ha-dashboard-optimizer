@@ -1,36 +1,78 @@
-This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
+# HA Dashboard Optimizer
+
+A Next.js app that uses a **local Llama model (via [Ollama](https://ollama.ai/))** to generate or optimize [Home Assistant Lovelace](https://www.home-assistant.io/dashboards/) dashboard YAML based on your real entities. No cloud inference — everything runs on your network.
+
+## Features
+
+- **Generate from Home Assistant** — connects to your HA instance with a long-lived access token, fetches every entity/area/domain, and produces a multi-view Lovelace dashboard tailored to it.
+- **Optimize existing YAML** — drop in any lovelace YAML and get a cleaner, grouped version back.
+- **Auto-discovery** — probes common localhost/Docker/LAN addresses for running Ollama servers and lists the models each one has available.
+- **Streaming output** — tokens appear in the output pane as the model emits them, and a **Cancel** button aborts a long generation.
+- **YAML validation** — every response is parsed with `js-yaml`; a badge shows view/card counts or flags a parse error.
+- **Local-first** — Ollama URL, model and HA URL are stored in `localStorage`; the long-lived access token is kept in memory only.
+
+## Architecture
+
+```
+src/
+├─ app/
+│  ├─ page.tsx                ← thin composition root
+│  ├─ layout.tsx
+│  └─ api/
+│     ├─ discover-ollama/     ← probes candidates with short timeouts
+│     ├─ ha-entities/         ← pulls states/areas/config from HA
+│     ├─ generate-dashboard/  ← SSE-streamed Ollama chat (generate)
+│     └─ optimize/            ← SSE-streamed Ollama chat (optimize)
+├─ components/                ← presentational pieces (Header, OutputPanel, …)
+├─ hooks/                     ← useOllama, useHomeAssistant, useDashboardJob, useLocalStorage
+└─ lib/
+   ├─ ollama.ts               ← fetch wrapper + NDJSON streaming generator
+   ├─ sse.ts                  ← Server-Sent-Events parser for the client
+   ├─ prompts.ts              ← system prompts + few-shot examples
+   ├─ ha.ts                   ← HA summary → prompt
+   ├─ yaml-extract.ts         ← pulls `views:` YAML out of free-form LLM output
+   ├─ yaml-validate.ts        ← js-yaml parse + view/card tally
+   └─ types.ts
+```
+
+API routes proxy the long-lived Ollama and HA requests so the browser never holds an open connection to your LAN; they return NDJSON-derived SSE frames (`event: chunk`, `event: done`, `event: error`) to the client.
 
 ## Getting Started
 
-First, run the development server:
+### Prerequisites
+
+- [Node.js 20+](https://nodejs.org/) (Next 16 requires it)
+- [Ollama](https://ollama.ai/) running somewhere on your network, with at least one chat model pulled:
+  ```bash
+  ollama pull llama3
+  ```
+- A [Home Assistant](https://www.home-assistant.io/) instance with a [long-lived access token](https://www.home-assistant.io/docs/authentication/#your-account-profile) (only needed for the **Generate** mode).
+
+### Install & run
 
 ```bash
+npm install
 npm run dev
-# or
-yarn dev
-# or
-pnpm dev
-# or
-bun dev
 ```
 
-Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
+Then open [http://localhost:3000](http://localhost:3000).
 
-You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
+### Scripts
 
-This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
+| Script | Purpose |
+| --- | --- |
+| `npm run dev` | Start the dev server with hot reload |
+| `npm run build` | Production build |
+| `npm start` | Run the production build |
+| `npm run lint` | ESLint |
 
-## Learn More
+## Privacy
 
-To learn more about Next.js, take a look at the following resources:
+- The HA **long-lived access token** is kept in React state only. It is posted once to `/api/ha-entities` to fetch your entities and never persisted.
+- The entity list sent to Ollama is capped per-domain (default 50) to keep the prompt bounded; the UI surfaces when truncation happens.
+- All LLM traffic goes to the Ollama server you pick — no third-party calls.
 
-- [Next.js Documentation](https://nextjs.org/docs) - learn about Next.js features and API.
-- [Learn Next.js](https://nextjs.org/learn) - an interactive Next.js tutorial.
+## License
 
-You can check out [the Next.js GitHub repository](https://github.com/vercel/next.js) - your feedback and contributions are welcome!
+MIT.
 
-## Deploy on Vercel
-
-The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
-
-Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
