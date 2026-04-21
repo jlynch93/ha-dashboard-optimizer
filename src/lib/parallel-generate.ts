@@ -13,7 +13,7 @@
 //      complete document plus validation.
 
 import { buildEntityPrompt } from "./ha";
-import { ollamaChat, ollamaChatStream, OllamaError } from "./ollama";
+import { ollamaChatStream, OllamaError } from "./ollama";
 import {
   CARD_EXAMPLE_ASSISTANT,
   CARD_EXAMPLE_USER,
@@ -74,7 +74,12 @@ export async function* runParallelGeneration(
 
   let plan: ParallelPlan;
   try {
-    const raw = await ollamaChat({
+    // Stream the planner call even though we only use the final text. This
+    // keeps bytes flowing to Cloudflare (and any other reverse proxy) from
+    // the first token onward — otherwise a slow planner response can exceed
+    // the 100s edge read timeout and 524 before we ever see its output.
+    let raw = "";
+    for await (const chunk of ollamaChatStream({
       endpoint: endpoints[0],
       model: opts.plannerModel,
       format: "json",
@@ -86,7 +91,9 @@ export async function* runParallelGeneration(
         { role: "assistant", content: PLANNER_EXAMPLE_ASSISTANT },
         { role: "user", content: buildPlannerUserPrompt(opts.summary) },
       ],
-    });
+    })) {
+      raw += chunk;
+    }
     plan = parsePlanOrFallback(raw, opts.summary);
   } catch (err) {
     // Planner call failed entirely — use the fallback plan and keep going.
