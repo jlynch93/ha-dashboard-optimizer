@@ -17,6 +17,14 @@ export interface OllamaChatOptions {
   options?: Record<string, unknown>;
   /** Ollama's top-level `format` field. Use "json" to force JSON output. */
   format?: "json" | string;
+  /**
+   * Ollama's top-level `keep_alive` field. Controls how long the model stays
+   * resident in memory after the call. Examples: "30m", "1h", "-1" (forever).
+   * Keeping models warm makes the next call's first token arrive in seconds
+   * instead of minutes — critical when requests go through proxies with short
+   * read-timeouts (e.g., Cloudflare's 100s edge limit).
+   */
+  keepAlive?: string;
 }
 
 export class OllamaError extends Error {
@@ -60,6 +68,7 @@ export async function ollamaChat(opts: OllamaChatOptions): Promise<string> {
     stream: false,
     options,
     ...(format ? { format } : {}),
+    ...(opts.keepAlive ? { keep_alive: opts.keepAlive } : {}),
   }, composeSignal(timeoutMs, signal));
 
   const data = await response.json();
@@ -87,6 +96,7 @@ export async function* ollamaChatStream(opts: OllamaChatOptions): AsyncGenerator
     stream: true,
     options,
     ...(format ? { format } : {}),
+    ...(opts.keepAlive ? { keep_alive: opts.keepAlive } : {}),
   }, composeSignal(timeoutMs, signal));
 
   if (!response.body) {

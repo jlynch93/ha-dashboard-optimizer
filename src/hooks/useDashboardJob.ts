@@ -128,8 +128,25 @@ export function useDashboardJob(): UseDashboardJobResult {
               // No-op — UI shows the "planning" state via empty views list.
               break;
             }
+            case "planner_progress": {
+              // Live liveness indicator — total planner chars so far.
+              const payload = JSON.parse(event.data) as { chars: number };
+              setStats((s) => ({ ...s, chars: payload.chars }));
+              break;
+            }
+            case "planner_timeout": {
+              // Planner hit its deadline; the orchestrator will follow up with
+              // a `planner_done` carrying a heuristic plan. Surface a toast-ish
+              // explanation through `explanation` so the UI can show it.
+              const payload = JSON.parse(event.data) as { reason: string };
+              setExplanation(payload.reason);
+              break;
+            }
             case "planner_done": {
-              const payload = JSON.parse(event.data) as { plan: ParallelPlan };
+              const payload = JSON.parse(event.data) as {
+                plan: ParallelPlan;
+                fallback?: boolean;
+              };
               setPlan(payload.plan);
               setViews(
                 payload.plan.views.map((v, i) => ({
@@ -140,6 +157,13 @@ export function useDashboardJob(): UseDashboardJobResult {
                   chars: 0,
                 })),
               );
+              if (payload.fallback) {
+                setExplanation(
+                  (prev) =>
+                    prev ||
+                    "Used heuristic plan (AI planner was too slow). View assignments are grouped by domain.",
+                );
+              }
               break;
             }
             case "view_start": {

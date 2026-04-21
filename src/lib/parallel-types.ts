@@ -38,7 +38,12 @@ export interface ViewProgress {
 /** Events emitted by the orchestrator over SSE. Mirrors useDashboardJob. */
 export type FastJobEvent =
   | { event: "planner_start"; data: Record<string, never> }
-  | { event: "planner_done"; data: { plan: ParallelPlan; elapsedMs: number } }
+  | { event: "planner_progress"; data: { chars: number } }
+  | {
+      event: "planner_timeout";
+      data: { elapsedMs: number; reason: string };
+    }
+  | { event: "planner_done"; data: { plan: ParallelPlan; elapsedMs: number; fallback?: boolean } }
   | { event: "view_start"; data: { index: number; title: string; icon: string; endpoint: string } }
   | { event: "view_chunk"; data: { index: number; content: string } }
   | {

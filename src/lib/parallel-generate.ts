@@ -44,6 +44,18 @@ export interface ParallelGenerateOptions {
   cardOptions?: Record<string, unknown>;
   /** Ollama `options` passed to the planner call. */
   plannerOptions?: Record<string, unknown>;
+  /**
+   * Milliseconds to wait for the planner before giving up and using the
+   * deterministic fallback plan. Defaults to 60s — slightly under Cloudflare's
+   * 100s edge-timeout so the whole request doesn't 524.
+   */
+  plannerTimeoutMs?: number;
+  /**
+   * Ollama `keep_alive` value. Defaults to "30m". Keeping the model resident
+   * drastically improves first-token latency on subsequent calls, which is
+   * what otherwise causes Cloudflare-proxied Ollama hosts to 524.
+   */
+  keepAlive?: string;
 }
 
 // Intermediate event shape emitted by the orchestrator — a subset of
@@ -56,6 +68,8 @@ export type OrchestratorEvent =
 
 const DEFAULT_PLANNER_OPTIONS = { temperature: 0.1, num_predict: 2048 };
 const DEFAULT_CARD_OPTIONS = { temperature: 0.2, num_predict: 2048 };
+const DEFAULT_PLANNER_TIMEOUT_MS = 60_000;
+const DEFAULT_KEEP_ALIVE = "30m";
 
 /**
  * Main entry point. Returns an async generator of events. Consumers forward
@@ -67,24 +81,45 @@ export async function* runParallelGeneration(
   const endpoints = opts.endpoints.length > 0 ? opts.endpoints : ["http://localhost:11434"];
   const plannerOptions = { ...DEFAULT_PLANNER_OPTIONS, ...opts.plannerOptions };
   const cardOptions = { ...DEFAULT_CARD_OPTIONS, ...opts.cardOptions };
+  const plannerTimeoutMs = opts.plannerTimeoutMs ?? DEFAULT_PLANNER_TIMEOUT_MS;
+  const keepAlive = opts.keepAlive ?? DEFAULT_KEEP_ALIVE;
 
   // ------- Phase 1: Planner -------------------------------------------------
+  // The planner is the single biggest cause of Cloudflare 524s: if the model
+  // is cold-loading from disk or just slow on the first token, no bytes reach
+  // our edge for tens of seconds. Three defenses, in order:
+  //
+  //   a) Stream the planner and forward progress events, so the outer SSE
+  //      pipe has steady activity the moment Ollama starts producing tokens.
+  //   b) Race it against a `plannerTimeoutMs` (default 60s, below CF's 100s
+  //      edge timeout). If it misses the deadline, abort the planner call and
+  //      fall back to the deterministic domain-based plan so the run still
+  //      completes.
+  //   c) Pass `keep_alive: "30m"` so once the model is loaded, subsequent runs
+  //      start emitting tokens in seconds instead of minutes.
   yield { event: "planner_start", data: {} };
   const plannerStartedAt = Date.now();
 
+  const plannerController = new AbortController();
+  const plannerSignal = AbortSignal.any([opts.signal, plannerController.signal]);
+  let plannerTimedOut = false;
+  const timeoutHandle = setTimeout(() => {
+    plannerTimedOut = true;
+    plannerController.abort();
+  }, plannerTimeoutMs);
+
   let plan: ParallelPlan;
+  let fallbackUsed = false;
+
   try {
-    // Stream the planner call even though we only use the final text. This
-    // keeps bytes flowing to Cloudflare (and any other reverse proxy) from
-    // the first token onward — otherwise a slow planner response can exceed
-    // the 100s edge read timeout and 524 before we ever see its output.
     let raw = "";
     for await (const chunk of ollamaChatStream({
       endpoint: endpoints[0],
       model: opts.plannerModel,
       format: "json",
       options: plannerOptions,
-      signal: opts.signal,
+      keepAlive,
+      signal: plannerSignal,
       messages: [
         { role: "system", content: PLANNER_SYSTEM_PROMPT },
         { role: "user", content: PLANNER_EXAMPLE_USER },
@@ -93,21 +128,49 @@ export async function* runParallelGeneration(
       ],
     })) {
       raw += chunk;
+      // Surface liveness so the UI can show the planner is actually working.
+      yield { event: "planner_progress", data: { chars: raw.length } };
     }
     plan = parsePlanOrFallback(raw, opts.summary);
   } catch (err) {
-    // Planner call failed entirely — use the fallback plan and keep going.
-    if (err instanceof OllamaError) {
-      // Fatal: without a reachable Ollama there's no way to generate cards.
-      yield { event: "error", data: { message: err.message, status: err.status } };
+    clearTimeout(timeoutHandle);
+
+    // If the outer caller cancelled, surface that immediately.
+    if (opts.signal.aborted) {
+      yield { event: "error", data: { message: "Cancelled", status: 499 } };
       return;
     }
-    plan = buildFallbackPlan(opts.summary);
+
+    // Planner timed out — fall through to the deterministic fallback plan.
+    if (plannerTimedOut) {
+      yield {
+        event: "planner_timeout",
+        data: {
+          elapsedMs: Date.now() - plannerStartedAt,
+          reason: `Planner did not respond within ${(plannerTimeoutMs / 1000).toFixed(0)}s. Using heuristic plan instead.`,
+        },
+      };
+      plan = buildFallbackPlan(opts.summary);
+      fallbackUsed = true;
+    } else if (err instanceof OllamaError) {
+      // Genuine Ollama-side failure (not a timeout): abort — we can't reach it.
+      yield { event: "error", data: { message: err.message, status: err.status } };
+      return;
+    } else {
+      // Unknown failure parsing/reading planner — degrade gracefully.
+      plan = buildFallbackPlan(opts.summary);
+      fallbackUsed = true;
+    }
   }
+  clearTimeout(timeoutHandle);
 
   yield {
     event: "planner_done",
-    data: { plan, elapsedMs: Date.now() - plannerStartedAt },
+    data: {
+      plan,
+      elapsedMs: Date.now() - plannerStartedAt,
+      ...(fallbackUsed ? { fallback: true } : {}),
+    },
   };
 
   // ------- Phase 2: Fan-out -------------------------------------------------
@@ -123,6 +186,7 @@ export async function* runParallelGeneration(
       entitiesById,
       model: opts.cardModel,
       cardOptions,
+      keepAlive,
       signal: opts.signal,
       emit: (e) => queue.push(e),
     });
@@ -190,12 +254,13 @@ interface ViewTaskArgs {
   entitiesById: Map<string, HaEntity>;
   model: string;
   cardOptions: Record<string, unknown>;
+  keepAlive: string;
   signal: AbortSignal;
   emit: (e: OrchestratorEvent) => void;
 }
 
 async function runViewTask(args: ViewTaskArgs): Promise<string | null> {
-  const { index, view, endpoint, entitiesById, model, cardOptions, signal, emit } = args;
+  const { index, view, endpoint, entitiesById, model, cardOptions, keepAlive, signal, emit } = args;
   const startedAt = Date.now();
 
   emit({
@@ -228,6 +293,7 @@ ${entityLines || "  (none — output a single entities card with a friendly empt
       endpoint,
       model,
       options: cardOptions,
+      keepAlive,
       signal,
       messages: [
         { role: "system", content: CARD_SYSTEM_PROMPT },
