@@ -1,8 +1,8 @@
 "use client";
 
-import { Sparkles, Zap } from "lucide-react";
+import { ClipboardCheck, Sparkles, Zap } from "lucide-react";
 
-export type Mode = "generate" | "optimize";
+export type Mode = "generate" | "optimize" | "audit";
 
 interface ModeTabsProps {
   mode: Mode;
@@ -14,11 +14,15 @@ export function ModeTabs({ mode, onChange }: ModeTabsProps) {
     <div className="flex items-center gap-1 mb-6 p-1 bg-slate-800/50 border border-slate-700 rounded-xl w-fit">
       <TabButton active={mode === "generate"} onClick={() => onChange("generate")}>
         <Zap className="w-4 h-4" />
-        Generate from HA
+        Generate
       </TabButton>
       <TabButton active={mode === "optimize"} onClick={() => onChange("optimize")}>
         <Sparkles className="w-4 h-4" />
-        Optimize Existing
+        Optimize
+      </TabButton>
+      <TabButton active={mode === "audit"} onClick={() => onChange("audit")}>
+        <ClipboardCheck className="w-4 h-4" />
+        Audit
       </TabButton>
     </div>
   );

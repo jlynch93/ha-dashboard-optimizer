@@ -2,6 +2,8 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
+import { AuditInput } from "@/components/AuditInput";
+import { AuditReport } from "@/components/AuditReport";
 import { ErrorBanner } from "@/components/ErrorBanner";
 import { GenerateInput, type GenerateStrategy } from "@/components/GenerateInput";
 import { Header } from "@/components/Header";
@@ -12,6 +14,7 @@ import { ParallelProgress } from "@/components/ParallelProgress";
 import { SettingsDrawer } from "@/components/SettingsDrawer";
 import { TipsSection } from "@/components/TipsSection";
 import { useToast } from "@/components/Toaster";
+import { useAuditJob } from "@/hooks/useAuditJob";
 import { useDashboardJob } from "@/hooks/useDashboardJob";
 import { useHomeAssistant } from "@/hooks/useHomeAssistant";
 import { useLocalStorage } from "@/hooks/useLocalStorage";
@@ -34,6 +37,7 @@ export default function Home() {
   const ollama = useOllama();
   const ha = useHomeAssistant();
   const job = useDashboardJob();
+  const audit = useAuditJob();
   const toast = useToast();
 
   // All Ollama endpoints we can fan out across in Fast mode.
@@ -133,11 +137,30 @@ export default function Home() {
     }
   }, [yamlInput, ollama.ollamaUrl, ollama.model, job, toast]);
 
+  const handleAudit = useCallback(async () => {
+    if (!ha.summary) {
+      setClientError("Connect to Home Assistant first.");
+      setShowSettings(true);
+      return;
+    }
+    setClientError("");
+    const result = await audit.run(ha.summary);
+    if (result.ok) {
+      const r = audit.report;
+      const total = (r?.errors ?? 0) + (r?.warnings ?? 0) + (r?.infos ?? 0);
+      toast.push({
+        title: total === 0 ? "Audit complete — all clean!" : `Audit complete — ${total} finding${total === 1 ? "" : "s"}`,
+        description: r ? `${r.entityCount} entities scanned in ${r.elapsedMs}ms` : undefined,
+        kind: total === 0 ? "success" : "info",
+      });
+    }
+  }, [ha.summary, audit, toast]);
+
   const cancelWithToast = useCallback(() => {
     job.cancel();
   }, [job]);
 
-  const displayError = clientError || ha.error || job.error;
+  const displayError = clientError || ha.error || job.error || audit.error;
   const dismissError = () => {
     setClientError("");
   };
@@ -187,12 +210,11 @@ export default function Home() {
                 model={ollama.model}
                 strategy={strategyValue}
                 onStrategyChange={setStrategy}
-                hostCount={endpointPool.length}
                 onGenerate={handleGenerate}
                 onCancel={cancelWithToast}
                 onOpenSettings={() => setShowSettings(true)}
               />
-            ) : (
+            ) : mode === "optimize" ? (
               <OptimizeInput
                 yamlInput={yamlInput}
                 setYamlInput={setYamlInput}
@@ -202,6 +224,14 @@ export default function Home() {
                 onOptimize={handleOptimize}
                 onCancel={cancelWithToast}
                 onFileError={setClientError}
+              />
+            ) : (
+              <AuditInput
+                haConnected={ha.connected}
+                summary={ha.summary}
+                loading={audit.loading}
+                onAudit={handleAudit}
+                onOpenSettings={() => setShowSettings(true)}
               />
             )}
 
@@ -222,26 +252,28 @@ export default function Home() {
           </div>
 
           <div className="space-y-4">
-            {/* Fast mode: show per-view progress grid while the job runs.
-                Once complete, the stitched YAML renders in the regular output
-                pane below, so the user sees both the live plan and the final
-                document. In Quality mode this is a no-op. */}
-            {(job.views.length > 0 || (job.loading && strategyValue !== "quality" && mode === "generate")) && (
-              <ParallelProgress
-                views={job.views}
-                plan={job.plan}
-                elapsedMs={job.stats.elapsedMs}
-                loading={job.loading}
-              />
+            {mode === "audit" ? (
+              <AuditReport report={audit.report} loading={audit.loading} haUrl={ha.haUrl} haToken={ha.haToken} />
+            ) : (
+              <>
+                {(job.views.length > 0 || (job.loading && strategyValue !== "quality" && mode === "generate")) && (
+                  <ParallelProgress
+                    views={job.views}
+                    plan={job.plan}
+                    elapsedMs={job.stats.elapsedMs}
+                    loading={job.loading}
+                  />
+                )}
+                <OutputPanel
+                  mode={mode}
+                  output={job.output}
+                  explanation={job.explanation}
+                  validation={job.validation}
+                  loading={job.loading}
+                  stats={job.stats}
+                />
+              </>
             )}
-            <OutputPanel
-              mode={mode}
-              output={job.output}
-              explanation={job.explanation}
-              validation={job.validation}
-              loading={job.loading}
-              stats={job.stats}
-            />
           </div>
         </div>
 

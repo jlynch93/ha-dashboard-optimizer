@@ -22,8 +22,6 @@ interface GenerateInputProps {
   model: string;
   strategy: GenerateStrategy;
   onStrategyChange: (strategy: GenerateStrategy) => void;
-  /** How many Ollama hosts the Fast pipeline will fan out across. `1` means no fan-out. */
-  hostCount: number;
   onGenerate: () => void;
   onCancel: () => void;
   onOpenSettings: () => void;
@@ -56,7 +54,6 @@ export function GenerateInput(props: GenerateInputProps) {
     model,
     strategy,
     onStrategyChange,
-    hostCount,
     onGenerate,
     onCancel,
     onOpenSettings,
@@ -127,7 +124,6 @@ export function GenerateInput(props: GenerateInputProps) {
             strategy={strategy}
             onChange={onStrategyChange}
             disabled={loading}
-            hostCount={hostCount}
           />
 
           {loading ? (
@@ -215,7 +211,6 @@ function StrategyToggle({
   strategy: GenerateStrategy;
   onChange: (s: GenerateStrategy) => void;
   disabled: boolean;
-  hostCount: number;
 }) {
   return (
     <div className="p-1 bg-slate-900/60 border border-slate-700 rounded-xl">
