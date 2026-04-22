@@ -24,7 +24,8 @@ export default function Home() {
   const [clientError, setClientError] = useState("");
   // Persist user's preferred generation strategy across reloads.
   const [strategy, setStrategyRaw] = useLocalStorage("generateStrategy", "fast");
-  const strategyValue: GenerateStrategy = strategy === "quality" ? "quality" : "fast";
+  const strategyValue: GenerateStrategy =
+    strategy === "quality" ? "quality" : strategy === "instant" ? "instant" : "fast";
   const setStrategy = useCallback(
     (s: GenerateStrategy) => setStrategyRaw(s),
     [setStrategyRaw],
@@ -84,17 +85,23 @@ export default function Home() {
       return;
     }
     setClientError("");
-    const isFast = strategyValue === "fast";
+
+    const modeMap: Record<GenerateStrategy, "generate-instant" | "generate-fast" | "generate"> = {
+      instant: "generate-instant",
+      fast: "generate-fast",
+      quality: "generate",
+    };
     const result = await job.start({
-      mode: isFast ? "generate-fast" : "generate",
+      mode: modeMap[strategyValue],
       ollamaUrl: ollama.ollamaUrl,
       model: ollama.model,
       summary: ha.summary,
-      extraEndpoints: isFast ? extraEndpoints : undefined,
+      extraEndpoints: strategyValue === "fast" ? extraEndpoints : undefined,
     });
+    const label = strategyValue === "instant" ? "Instant" : strategyValue === "fast" ? "Fast" : "Quality";
     if (result.ok) {
       toast.push({
-        title: isFast ? "Dashboard generated (Fast)" : "Dashboard generated",
+        title: `Dashboard generated (${label})`,
         description: `Finished in ${(job.stats.elapsedMs / 1000).toFixed(1)}s`,
         kind: "success",
       });
@@ -219,7 +226,7 @@ export default function Home() {
                 Once complete, the stitched YAML renders in the regular output
                 pane below, so the user sees both the live plan and the final
                 document. In Quality mode this is a no-op. */}
-            {(job.views.length > 0 || (job.loading && strategyValue === "fast" && mode === "generate")) && (
+            {(job.views.length > 0 || (job.loading && strategyValue !== "quality" && mode === "generate")) && (
               <ParallelProgress
                 views={job.views}
                 plan={job.plan}

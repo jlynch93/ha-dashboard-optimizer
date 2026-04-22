@@ -92,6 +92,22 @@ Rules:
 - Group related items with horizontal-stack or grid when it improves layout.
 - Never output markdown, never output prose, never output code fences. YAML only.`;
 
+// ---------------------------------------------------------------------------
+// Single-stream prompt: generates ALL views in one streaming response.
+// Used by Fast mode so we only open one connection to Ollama.
+// ---------------------------------------------------------------------------
+
+export const SINGLE_STREAM_SYSTEM_PROMPT = `You generate a complete Home Assistant Lovelace dashboard as YAML. Output ONLY valid YAML starting with "views:" and containing ALL the views described below. Use 2-space indentation.
+
+Rules:
+- Output the YAML and nothing else. No markdown, no prose, no code fences.
+- Start with "views:" on the first line.
+- Each view starts with "  - title:" (indented 2 spaces).
+- Use only the entities listed for each view. Do not invent entities.
+- Pick appropriate card types: weather-forecast, thermostat, gauge, light, media-control, glance, entities, picture-entity, horizontal-stack, grid.
+- Group related items with horizontal-stack or grid when it improves layout.
+- Produce all views in the order given.`;
+
 export const CARD_EXAMPLE_USER = `View:
   title: Overview
   path: overview

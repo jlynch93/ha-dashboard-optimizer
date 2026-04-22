@@ -15,12 +15,10 @@
 import { buildEntityPrompt } from "./ha";
 import { ollamaChatStream, OllamaError } from "./ollama";
 import {
-  CARD_EXAMPLE_ASSISTANT,
-  CARD_EXAMPLE_USER,
-  CARD_SYSTEM_PROMPT,
   PLANNER_EXAMPLE_ASSISTANT,
   PLANNER_EXAMPLE_USER,
   PLANNER_SYSTEM_PROMPT,
+  SINGLE_STREAM_SYSTEM_PROMPT,
 } from "./parallel-prompts";
 import type {
   FastJobEvent,
@@ -80,7 +78,6 @@ export async function* runParallelGeneration(
 ): AsyncGenerator<OrchestratorEvent> {
   const endpoints = opts.endpoints.length > 0 ? opts.endpoints : ["http://localhost:11434"];
   const plannerOptions = { ...DEFAULT_PLANNER_OPTIONS, ...opts.plannerOptions };
-  const cardOptions = { ...DEFAULT_CARD_OPTIONS, ...opts.cardOptions };
   const plannerTimeoutMs = opts.plannerTimeoutMs ?? DEFAULT_PLANNER_TIMEOUT_MS;
   const keepAlive = opts.keepAlive ?? DEFAULT_KEEP_ALIVE;
 
@@ -173,154 +170,104 @@ export async function* runParallelGeneration(
     },
   };
 
-  // ------- Phase 2: Fan-out -------------------------------------------------
-  const queue = createAsyncQueue<OrchestratorEvent>();
+  // ------- Phase 2: Single-stream generation --------------------------------
+  // Send ONE streaming request to Ollama containing all view assignments from
+  // the plan. This avoids multiple connections (which queue in Ollama and get
+  // killed by Cloudflare's 100s timeout). Tokens flow from the first second,
+  // the SSE pipe stays alive, and the model's KV cache stays warm across all
+  // views within the same request.
   const entitiesById = indexEntitiesById(opts.summary);
+  const endpoint = endpoints[0];
+  const userPrompt = buildSingleStreamPrompt(plan, entitiesById);
+  const genStartedAt = Date.now();
 
-  const tasks = plan.views.map((view, index) => {
-    const endpoint = endpoints[index % endpoints.length];
-    return runViewTask({
-      index,
-      view,
+  // Mark all views as running — they'll complete as we detect boundaries.
+  for (let i = 0; i < plan.views.length; i += 1) {
+    yield {
+      event: "view_start",
+      data: {
+        index: i,
+        title: plan.views[i].title,
+        icon: plan.views[i].icon,
+        endpoint,
+      },
+    };
+  }
+
+  let fullOutput = "";
+  try {
+    for await (const chunk of ollamaChatStream({
       endpoint,
-      entitiesById,
       model: opts.cardModel,
-      cardOptions,
+      options: { ...DEFAULT_CARD_OPTIONS, ...opts.cardOptions, num_predict: 4096 },
       keepAlive,
       signal: opts.signal,
-      emit: (e) => queue.push(e),
-    });
-  });
+      messages: [
+        { role: "system", content: SINGLE_STREAM_SYSTEM_PROMPT },
+        { role: "user", content: userPrompt },
+      ],
+    })) {
+      const prevViews = countViewBoundaries(fullOutput);
+      fullOutput += chunk;
+      const currViews = countViewBoundaries(fullOutput);
 
-  const allSettled = Promise.allSettled(tasks).finally(() => queue.close());
+      // Emit chunk event for overall char tracking.
+      yield { event: "view_chunk", data: { index: prevViews, content: chunk } };
 
-  // Drain events as they arrive.
-  for await (const event of queue) {
-    yield event;
-  }
-  const results = await allSettled;
-
-  // ------- Phase 3: Stitch --------------------------------------------------
-  const viewYamls: string[] = [];
-  const errors: string[] = [];
-  for (let i = 0; i < plan.views.length; i += 1) {
-    const result = results[i];
-    if (result.status === "fulfilled" && result.value) {
-      viewYamls.push(indentViewBlock(result.value));
-    } else if (result.status === "fulfilled") {
-      errors.push(`View "${plan.views[i].title}" produced no YAML.`);
-    } else {
-      errors.push(`View "${plan.views[i].title}" failed: ${describe(result.reason)}`);
+      // Detect new `  - title:` boundaries → mark previous views as done.
+      if (currViews > prevViews) {
+        for (let v = prevViews; v < currViews && v < plan.views.length; v += 1) {
+          if (v > 0) {
+            yield {
+              event: "view_done",
+              data: { index: v - 1, yaml: "", elapsedMs: Date.now() - genStartedAt },
+            };
+          }
+        }
+      }
     }
+  } catch (err) {
+    if (opts.signal.aborted) {
+      yield { event: "error", data: { message: "Cancelled", status: 499 } };
+      return;
+    }
+    const message = err instanceof Error ? err.message : String(err);
+    yield { event: "error", data: { message, status: 502 } };
+    return;
   }
 
-  if (viewYamls.length === 0) {
+  // Mark last view as done.
+  if (plan.views.length > 0) {
+    yield {
+      event: "view_done",
+      data: {
+        index: plan.views.length - 1,
+        yaml: "",
+        elapsedMs: Date.now() - genStartedAt,
+      },
+    };
+  }
+
+  // ------- Phase 3: Clean + validate ----------------------------------------
+  const finalYaml = cleanSingleStreamOutput(fullOutput);
+
+  if (!finalYaml) {
     yield {
       event: "error",
-      data: {
-        message: `All per-view generations failed. ${errors.join(" ")}`.trim(),
-        status: 502,
-      },
+      data: { message: "Model produced no usable YAML.", status: 502 },
     };
     return;
   }
 
-  const finalYaml = `views:\n${viewYamls.join("\n")}\n`;
   const validation = validateLovelaceYaml(finalYaml);
-  const summaryLine =
-    errors.length > 0
-      ? `${viewYamls.length} of ${plan.views.length} views generated. ${errors.join(" ")}`
-      : `Generated ${plan.views.length} views in parallel.`;
-
   yield {
     event: "done",
     data: {
       optimizedYaml: finalYaml,
-      explanation: summaryLine,
+      explanation: `Fast: generated ${plan.views.length} views in a single streaming request (${((Date.now() - genStartedAt) / 1000).toFixed(1)}s).`,
       validation,
     },
   };
-}
-
-// ---------------------------------------------------------------------------
-// Per-view task: streams tokens from Ollama, forwards chunks, returns the
-// final collected YAML (or null on failure).
-// ---------------------------------------------------------------------------
-
-interface ViewTaskArgs {
-  index: number;
-  view: PlanView;
-  endpoint: string;
-  entitiesById: Map<string, HaEntity>;
-  model: string;
-  cardOptions: Record<string, unknown>;
-  keepAlive: string;
-  signal: AbortSignal;
-  emit: (e: OrchestratorEvent) => void;
-}
-
-async function runViewTask(args: ViewTaskArgs): Promise<string | null> {
-  const { index, view, endpoint, entitiesById, model, cardOptions, keepAlive, signal, emit } = args;
-  const startedAt = Date.now();
-
-  emit({
-    event: "view_start",
-    data: { index, title: view.title, icon: view.icon, endpoint },
-  });
-
-  const entityLines = view.entity_ids
-    .map((id) => entitiesById.get(id))
-    .filter((e): e is HaEntity => Boolean(e))
-    .map((e) => {
-      const bits = [`  ${e.entity_id} = "${e.friendly_name}" (${e.state})`];
-      if (e.device_class) bits.push(`class:${e.device_class}`);
-      if (e.unit) bits.push(`unit:${e.unit}`);
-      return bits.join(" ");
-    })
-    .join("\n");
-
-  const userPrompt = `View:
-  title: ${view.title}
-  path: ${view.path}
-  icon: ${view.icon}
-
-Entities:
-${entityLines || "  (none — output a single entities card with a friendly empty state)"}`;
-
-  try {
-    let full = "";
-    for await (const chunk of ollamaChatStream({
-      endpoint,
-      model,
-      options: cardOptions,
-      keepAlive,
-      signal,
-      messages: [
-        { role: "system", content: CARD_SYSTEM_PROMPT },
-        { role: "user", content: CARD_EXAMPLE_USER },
-        { role: "assistant", content: CARD_EXAMPLE_ASSISTANT },
-        { role: "user", content: userPrompt },
-      ],
-    })) {
-      full += chunk;
-      emit({ event: "view_chunk", data: { index, content: chunk } });
-    }
-
-    const cleaned = cleanViewYaml(full, view);
-    emit({
-      event: "view_done",
-      data: { index, yaml: cleaned, elapsedMs: Date.now() - startedAt },
-    });
-    return cleaned;
-  } catch (err) {
-    if (err instanceof DOMException && err.name === "AbortError") {
-      emit({ event: "view_error", data: { index, message: "Cancelled" } });
-      return null;
-    }
-    const message = err instanceof Error ? err.message : String(err);
-    emit({ event: "view_error", data: { index, message } });
-    return null;
-  }
 }
 
 // ---------------------------------------------------------------------------
@@ -377,7 +324,7 @@ function sanitizeView(v: Partial<PlanView>, entityIds: Set<string>): PlanView | 
  * Deterministic plan based on entity domains. Used when the planner LLM fails
  * or produces an unparseable response.
  */
-function buildFallbackPlan(summary: HaSummary): ParallelPlan {
+export function buildFallbackPlan(summary: HaSummary): ParallelPlan {
   const byDomain = new Map<string, string[]>();
   for (const group of summary.domains) {
     byDomain.set(
@@ -440,7 +387,7 @@ Entities:
 ${buildEntityPrompt(summary)}`;
 }
 
-function indexEntitiesById(summary: HaSummary): Map<string, HaEntity> {
+export function indexEntitiesById(summary: HaSummary): Map<string, HaEntity> {
   const map = new Map<string, HaEntity>();
   for (const group of summary.domains) {
     for (const e of group.entities) map.set(e.entity_id, e);
@@ -449,103 +396,64 @@ function indexEntitiesById(summary: HaSummary): Map<string, HaEntity> {
 }
 
 /**
- * Clean a per-view response. The model sometimes wraps output in code fences
- * or adds prose around the YAML. Extract the first `- title:` block and strip
- * accordingly.
+ * Build a single user prompt that lists all views and their entities so the
+ * model can generate the entire dashboard in one streaming response.
  */
-function cleanViewYaml(raw: string, view: PlanView): string {
-  // Drop code fences.
-  const fenceStripped = raw.replace(/```(?:yaml|yml|YAML)?\s*\n?/g, "").replace(/```/g, "");
-  // Find the first `- title:` line to slice from.
-  const match = fenceStripped.match(/(^|\n)(\s*)- title:/);
-  let sliced = match ? fenceStripped.slice(match.index! + (match[1] ? 1 : 0)) : fenceStripped;
+function buildSingleStreamPrompt(
+  plan: ParallelPlan,
+  entitiesById: Map<string, HaEntity>,
+): string {
+  const sections = plan.views.map((view, i) => {
+    const entityLines = view.entity_ids
+      .map((id) => entitiesById.get(id))
+      .filter((e): e is HaEntity => Boolean(e))
+      .map((e) => {
+        const bits = [`    ${e.entity_id} = "${e.friendly_name}" (${e.state})`];
+        if (e.device_class) bits.push(`class:${e.device_class}`);
+        if (e.unit) bits.push(`unit:${e.unit}`);
+        return bits.join(" ");
+      })
+      .join("\n");
+    return `View ${i + 1}: "${view.title}" (icon: ${view.icon}, path: ${view.path})\n  Entities:\n${entityLines || "    (none)"}`;
+  });
+  return `Generate a dashboard with these ${plan.views.length} views:\n\n${sections.join("\n\n")}`;
+}
 
-  // Dedent so `- title:` sits at column 0. The stitcher re-indents.
-  const leading = sliced.match(/^(\s*)-/);
-  if (leading && leading[1].length > 0) {
-    const dedent = new RegExp(`^${" ".repeat(leading[1].length)}`, "gm");
-    sliced = sliced.replace(dedent, "");
+/**
+ * Count how many `- title:` lines (at ≤4 spaces indent) appear in the
+ * streamed output so far. Used to detect view boundaries on the fly.
+ */
+function countViewBoundaries(text: string): number {
+  const matches = text.match(/^ {0,4}- title:/gm);
+  return matches ? matches.length : 0;
+}
+
+/**
+ * Clean the full single-stream model output into valid Lovelace YAML.
+ * Strips code fences, leading prose, and ensures it starts with `views:`.
+ */
+function cleanSingleStreamOutput(raw: string): string | null {
+  // Drop code fences.
+  let text = raw.replace(/```(?:yaml|yml|YAML)?\s*\n?/g, "").replace(/```/g, "").trim();
+
+  // If model wrapped output in prose, find the first `views:` line.
+  const viewsIdx = text.indexOf("views:");
+  if (viewsIdx > 0) {
+    text = text.slice(viewsIdx);
   }
 
-  // Stop at the first line that looks like prose (starts with # or *).
-  const lines = sliced.split("\n");
+  // Truncate at trailing prose (lines starting with # or **).
+  const lines = text.split("\n");
   const cleaned: string[] = [];
+  let started = false;
   for (const line of lines) {
+    if (!started && line.trim().startsWith("views:")) started = true;
+    if (!started) continue;
     if (/^#{1,6}\s/.test(line) || /^\*\*/.test(line)) break;
     cleaned.push(line);
   }
-  const out = cleaned.join("\n").trimEnd();
 
-  // If the model completely failed to produce a `- title:` line, synthesize a
-  // tiny stub so stitching doesn't explode.
-  if (!out.startsWith("- title:")) {
-    return `- title: ${view.title}\n  path: ${view.path}\n  icon: ${view.icon}\n  cards: []`;
-  }
-  return out;
-}
-
-/** Indent a dedented view block by 2 spaces so it nests under `views:`. */
-function indentViewBlock(block: string): string {
-  return block
-    .split("\n")
-    .map((line) => (line.length > 0 ? `  ${line}` : line))
-    .join("\n");
-}
-
-function describe(err: unknown): string {
-  if (err instanceof OllamaError) return err.message;
-  if (err instanceof Error) return err.message;
-  return String(err);
-}
-
-// ---------------------------------------------------------------------------
-// Async event queue. Used to fan events from N parallel tasks into a single
-// ordered consumer.
-// ---------------------------------------------------------------------------
-
-interface AsyncQueue<T> extends AsyncIterable<T> {
-  push(value: T): void;
-  close(): void;
-}
-
-function createAsyncQueue<T>(): AsyncQueue<T> {
-  const buffer: T[] = [];
-  let pending: ((result: IteratorResult<T>) => void) | null = null;
-  let closed = false;
-
-  return {
-    push(value: T) {
-      if (closed) return;
-      if (pending) {
-        const resolve = pending;
-        pending = null;
-        resolve({ value, done: false });
-      } else {
-        buffer.push(value);
-      }
-    },
-    close() {
-      closed = true;
-      if (pending) {
-        const resolve = pending;
-        pending = null;
-        resolve({ value: undefined as T, done: true });
-      }
-    },
-    [Symbol.asyncIterator](): AsyncIterator<T> {
-      return {
-        next(): Promise<IteratorResult<T>> {
-          if (buffer.length > 0) {
-            return Promise.resolve({ value: buffer.shift()!, done: false });
-          }
-          if (closed) {
-            return Promise.resolve({ value: undefined as T, done: true });
-          }
-          return new Promise<IteratorResult<T>>((resolve) => {
-            pending = resolve;
-          });
-        },
-      };
-    },
-  };
+  const result = cleaned.join("\n").trimEnd();
+  if (!result || !result.startsWith("views:")) return null;
+  return result + "\n";
 }

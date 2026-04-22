@@ -9,7 +9,7 @@ import type {
 } from "@/lib/parallel-types";
 import type { ExtractedYaml, HaSummary, YamlValidation } from "@/lib/types";
 
-type Mode = "generate" | "generate-fast" | "optimize";
+type Mode = "generate" | "generate-fast" | "generate-instant" | "optimize";
 
 interface StartOptions {
   mode: Mode;
@@ -296,6 +296,13 @@ function buildRequest(
           model: options.model,
           extraEndpoints: options.extraEndpoints,
           plannerModel: options.plannerModel,
+        },
+      };
+    case "generate-instant":
+      return {
+        endpoint: "/api/generate-instant",
+        body: {
+          summary: options.summary,
         },
       };
     case "optimize":
